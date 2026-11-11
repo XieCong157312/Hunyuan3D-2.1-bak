@@ -192,8 +192,9 @@ class ModelWorker:
             os.replace(glb_tmp, final_save_path)
             logger.info("Paint stage completed in %.2fs", time.time() - start_time)
         except Exception as e:
-            logger.exception("Texture generation failed; returning untextured Shape mesh")
-            final_save_path = initial_save_path
+            logger.exception("Texture generation failed")
+            # Combined Shape + Paint must not silently report an untextured mesh as success.
+            raise ValueError(f"Paint generation failed: {e}") from e
         finally:
             self._unload_paint()
             del image

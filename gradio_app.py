@@ -46,6 +46,11 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 import uuid
 import numpy as np
+from io import BytesIO
+from urllib.parse import quote
+from PIL import Image
+from fastapi import UploadFile, File, Form, HTTPException
+from starlette.concurrency import run_in_threadpool
 
 from hy3dshape.utils import logger
 from hy3dpaint.convert_utils import create_glb_with_pbr_materials
@@ -599,6 +604,11 @@ def build_app():
                                         variant='primary',
                                         visible=HAS_TEXTUREGEN,
                                         min_width=100)
+                    # Explicit one-click action: image -> Shape -> Paint -> textured GLB.
+                    btn_shape_paint = gr.Button(value='One-click Shape + Paint',
+                                                variant='primary',
+                                                visible=HAS_TEXTUREGEN,
+                                                min_width=150)
 
                 with gr.Group():
                     file_out = gr.File(label="File", visible=False)
@@ -714,6 +724,34 @@ Fast for very complex cases, Standard seldom use.',
         )
 
         btn_all.click(
+            generation_all,
+            inputs=[
+                caption,
+                image,
+                mv_image_front,
+                mv_image_back,
+                mv_image_left,
+                mv_image_right,
+                num_steps,
+                cfg_scale,
+                seed,
+                octree_resolution,
+                check_box_rembg,
+                num_chunks,
+                randomize_seed,
+            ],
+            outputs=[file_out, file_out2, html_gen_mesh, stats, seed]
+        ).then(
+            lambda: (gr.update(visible=True, value=True), gr.update(interactive=False), gr.update(interactive=True),
+                     gr.update(interactive=False)),
+            outputs=[export_texture, reduce_face, confirm_export, file_export],
+        ).then(
+            lambda: gr.update(selected='gen_mesh_panel'),
+            outputs=[tabs_output],
+        )
+
+        # Dedicated combined button: one upload triggers Shape and Paint sequentially.
+        btn_shape_paint.click(
             generation_all,
             inputs=[
                 caption,
@@ -896,8 +934,77 @@ if __name__ == '__main__':
 
     # https://discuss.huggingface.co/t/how-to-serve-an-html-file/33921/2
     # create a FastAPI app
-    app = FastAPI()
-    
+    app = FastAPI(title='Hunyuan3D-2.1 API', version='1.0.0')
+
+    @app.post('/api/v1/shape-paint')
+    async def api_shape_paint(
+        image: UploadFile = File(..., description='Input image (PNG/JPG/WebP)'),
+        steps: int = Form(30),
+        guidance_scale: float = Form(5.0),
+        seed: int = Form(1234),
+        octree_resolution: int = Form(256),
+        remove_background: bool = Form(True),
+        randomize_seed: bool = Form(False),
+        num_chunks: int = Form(8000),
+    ):
+        """Upload one image and synchronously return the final painted GLB URL."""
+        if not HAS_TEXTUREGEN:
+            raise HTTPException(status_code=503, detail='Paint module is disabled or unavailable')
+        if image.content_type and not image.content_type.startswith('image/'):
+            raise HTTPException(status_code=415, detail='Only image uploads are supported')
+        raw = await image.read()
+        if not raw:
+            raise HTTPException(status_code=400, detail='Uploaded image is empty')
+        try:
+            with Image.open(BytesIO(raw)) as opened:
+                input_image = opened.convert('RGBA')
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f'Invalid image: {exc}') from exc
+
+        try:
+            # Hold the GPU lock across Shape -> unload -> Paint -> unload.
+            result = await run_in_threadpool(
+                generation_all,
+                image=input_image,
+                steps=steps,
+                guidance_scale=guidance_scale,
+                seed=seed,
+                octree_resolution=octree_resolution,
+                check_box_rembg=remove_background,
+                num_chunks=num_chunks,
+                randomize_seed=randomize_seed,
+            )
+            white_update, textured_update, _viewer_html, stats_result, actual_seed = result
+            white_path = white_update.get('value') if isinstance(white_update, dict) else white_update
+            textured_path = textured_update.get('value') if isinstance(textured_update, dict) else textured_update
+            if not textured_path or not os.path.isfile(textured_path):
+                raise RuntimeError('Paint completed without producing the textured model file')
+
+            static_root = os.path.abspath(SAVE_DIR)
+            def static_url(path):
+                rel = os.path.relpath(os.path.abspath(path), static_root).replace(os.sep, '/')
+                return '/static/' + quote(rel, safe='/')
+
+            return {
+                'success': True,
+                'task_status': 'completed',
+                'input_filename': image.filename,
+                'white_model_url': static_url(white_path) if white_path and os.path.isfile(white_path) else None,
+                'textured_model_url': static_url(textured_path),
+                'seed': int(actual_seed),
+                'stats': stats_result,
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception('Shape + Paint API request failed')
+            raise HTTPException(status_code=500, detail=f'Shape/Paint generation failed: {exc}') from exc
+        finally:
+            try:
+                await image.close()
+            except Exception:
+                pass
+
     # create a static directory to store the static files
     static_dir = Path(SAVE_DIR).absolute()
     static_dir.mkdir(parents=True, exist_ok=True)
