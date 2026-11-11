@@ -33,6 +33,8 @@ import random
 import shutil
 import subprocess
 import time
+import gc
+import threading
 from glob import glob
 from pathlib import Path
 
@@ -213,6 +215,75 @@ height="{height}" width="100%" frameborder="0"></iframe>'
         </div>
     """
 
+# 24GB GPU mode: only one of Shape/Paint may be resident at a time.
+GPU_STAGE_LOCK = threading.RLock()
+i23d_worker = None
+tex_pipeline = None
+
+def release_gpu_memory():
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+def unload_shape_pipeline():
+    global i23d_worker
+    if i23d_worker is not None:
+        old, i23d_worker = i23d_worker, None
+        del old
+    release_gpu_memory()
+
+def unload_paint_pipeline():
+    global tex_pipeline
+    if tex_pipeline is not None:
+        old, tex_pipeline = tex_pipeline, None
+        del old
+    release_gpu_memory()
+
+def get_shape_pipeline():
+    global i23d_worker
+    if i23d_worker is None:
+        i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+            args.model_path, subfolder=args.subfolder, use_safetensors=False, device=args.device
+        )
+        if args.enable_flashvdm:
+            mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo
+            i23d_worker.enable_flashvdm(mc_algo=mc_algo)
+        if args.compile:
+            i23d_worker.compile()
+    return i23d_worker
+
+def get_paint_pipeline():
+    global tex_pipeline
+    if tex_pipeline is None:
+        conf = Hunyuan3DPaintConfig(max_num_view=args.paint_max_num_view, resolution=args.paint_resolution)
+        conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
+        conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+        conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
+        tex_pipeline = Hunyuan3DPaintPipeline(conf)
+    return tex_pipeline
+
+def serialized_gpu_call(fn):
+    def wrapper(*args_, **kwargs_):
+        with GPU_STAGE_LOCK:
+            try:
+                return fn(*args_, **kwargs_)
+            finally:
+                # Safety net for exceptions in either stage.
+                unload_shape_pipeline()
+                unload_paint_pipeline()
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
 @spaces.GPU(duration=60)
 def _gen_shape(
     caption=None,
@@ -299,7 +370,8 @@ def _gen_shape(
 
     generator = torch.Generator()
     generator = generator.manual_seed(int(seed))
-    outputs = i23d_worker(
+    shape_pipeline = get_shape_pipeline()
+    outputs = shape_pipeline(
         image=image,
         num_inference_steps=steps,
         guidance_scale=guidance_scale,
@@ -314,6 +386,10 @@ def _gen_shape(
     tmp_start = time.time()
     mesh = export_to_trimesh(outputs)[0]
     time_meta['export to trimesh'] = time.time() - tmp_start
+    # The returned trimesh is CPU-side; drop inference tensors and Shape weights
+    # before any Paint model is initialized.
+    del outputs, generator, shape_pipeline
+    unload_shape_pipeline()
 
     stats['number_of_faces'] = mesh.faces.shape[0]
     stats['number_of_vertices'] = mesh.vertices.shape[0]
@@ -323,6 +399,7 @@ def _gen_shape(
     return mesh, main_image, save_folder, stats, seed
 
 @spaces.GPU(duration=60)
+@serialized_gpu_call
 def generation_all(
     caption=None,
     image=None,
@@ -378,7 +455,10 @@ def generation_all(
     tmp_time = time.time()
 
     text_path = os.path.join(save_folder, f'textured_mesh.obj')
-    path_textured = tex_pipeline(mesh_path=path, image_path=image, output_mesh_path=text_path, save_glb=False)
+    paint_pipeline = get_paint_pipeline()
+    path_textured = paint_pipeline(mesh_path=path, image_path=image, output_mesh_path=text_path, save_glb=False)
+    del paint_pipeline
+    unload_paint_pipeline()
         
     logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))
     stats['time']['texture generation'] = time.time() - tmp_time
@@ -405,6 +485,7 @@ def generation_all(
     )
 
 @spaces.GPU(duration=60)
+@serialized_gpu_call
 def shape_generation(
     caption=None,
     image=None,
@@ -746,7 +827,9 @@ if __name__ == '__main__':
     parser.add_argument('--disable_tex', action='store_true')
     parser.add_argument('--enable_flashvdm', action='store_true')
     parser.add_argument('--compile', action='store_true')
-    parser.add_argument('--low_vram_mode', action='store_true')
+    parser.add_argument('--low_vram_mode', action='store_true', help='Unload Shape before loading Paint; recommended for 24GB GPUs')
+    parser.add_argument('--paint_max_num_view', type=int, default=4)
+    parser.add_argument('--paint_resolution', type=int, default=512)
     args = parser.parse_args()
     
     SAVE_DIR = args.cache_path
@@ -780,43 +863,14 @@ if __name__ == '__main__':
     HAS_TEXTUREGEN = False
     if not args.disable_tex:
         try:
-            # Apply torchvision fix before importing basicsr/RealESRGAN
-            print("Applying torchvision compatibility fix for texture generation...")
-            try:
-                from torchvision_fix import apply_fix
-                fix_result = apply_fix()
-                if not fix_result:
-                    print("Warning: Torchvision fix may not have been applied successfully")
-            except Exception as fix_error:
-                print(f"Warning: Failed to apply torchvision fix: {fix_error}")
-            
-            # from hy3dgen.texgen import Hunyuan3DPaintPipeline
-            # texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(args.texgen_model_path)
-            # if args.low_vram_mode:
-            #     texgen_worker.enable_model_cpu_offload()
-
             from hy3dpaint.textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
-            conf = Hunyuan3DPaintConfig(max_num_view=8, resolution=768)
-            conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
-            conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
-            conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
-            tex_pipeline = Hunyuan3DPaintPipeline(conf)
-        
-            # Not help much, ignore for now.
-            # if args.compile:
-            #     texgen_worker.models['delight_model'].pipeline.unet.compile()
-            #     texgen_worker.models['delight_model'].pipeline.vae.compile()
-            #     texgen_worker.models['multiview_model'].pipeline.unet.compile()
-            #     texgen_worker.models['multiview_model'].pipeline.vae.compile()
-            
+            # Do not instantiate Paint here: its weights are loaded only after Shape
+            # has been exported and explicitly unloaded.
             HAS_TEXTUREGEN = True
-            
         except Exception as e:
             import traceback
             traceback.print_exc()
-            print(f"Error loading texture generator: {e}")
-            print("Failed to load texture generator.")
-            print('Please try to install requirements by following README.md')
+            print(f"Error importing texture generator: {e}")
             HAS_TEXTUREGEN = False
 
     HAS_T2I = True
@@ -832,17 +886,9 @@ if __name__ == '__main__':
     from hy3dshape.rembg import BackgroundRemover
 
     rmbg_worker = BackgroundRemover()
-    i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-        args.model_path,
-        subfolder=args.subfolder,
-        use_safetensors=False,
-        device=args.device,
-    )
-    if args.enable_flashvdm:
-        mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo
-        i23d_worker.enable_flashvdm(mc_algo=mc_algo)
-    if args.compile:
-        i23d_worker.compile()
+    # Shape weights are lazy-loaded on the first request. In low-VRAM mode they
+    # are unloaded before Paint weights are loaded.
+    i23d_worker = None
 
     floater_remove_worker = FloaterRemover()
     degenerate_face_remove_worker = DegenerateFaceRemover()
