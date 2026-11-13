@@ -101,7 +101,7 @@ cd hy3dpaint/custom_rasterizer
 pip install -e .
 cd ../..
 cd hy3dpaint/DifferentiableRenderer
-bash compile_mesh_painter.sh
+bash compile_mesh_painter.sh # 如果生成的so文件与py版本不对，那直接命令行直接sh文件里的命令，手动生成
 cd ../..
 
 wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth -P hy3dpaint/ckpt
